@@ -1,0 +1,100 @@
+#!/bin/bash
+exec 2>&1
+set -eo pipefail
+
+# ============================================
+# ADB Network Bridge Service
+# Exposes ADB port 5555 for remote connections
+# Enables: adb connect <container-hostname>:5555
+# ============================================
+
+ADB_PORT=5555
+MAX_RETRIES=60
+
+log() { echo "[adb-network] $(date '+%H:%M:%S') $*"; }
+
+source /app/docker_setup/adb_guard.sh
+ensure_adb_ready
+
+# Wait for emulator to be ready
+DEVICE_READY_MARKER="/tmp/adb-device-ready"
+MARKER_TIMEOUT=${MARKER_TIMEOUT:-${EMULATOR_TIMEOUT:-300}}
+marker_waited=0
+while [ ! -f "$DEVICE_READY_MARKER" ]; do
+    if [ $marker_waited -ge $MARKER_TIMEOUT ]; then
+        log "ERROR: Emulator readiness marker not found within ${MARKER_TIMEOUT}s"
+        exit 1
+    fi
+    log "Waiting for emulator readiness marker..."
+    sleep 2
+    marker_waited=$((marker_waited + 2))
+done
+
+log "ADB Network Bridge Service starting..."
+
+# Wait for emulator to be fully booted
+wait_for_boot() {
+    log "Waiting for emulator boot..."
+    local retries=0
+    while [ $retries -lt $MAX_RETRIES ]; do
+        if adb shell getprop sys.boot_completed 2>/dev/null | grep -q "1"; then
+            log "Emulator boot complete"
+            return 0
+        fi
+        sleep 2
+        retries=$((retries + 1))
+    done
+    log "ERROR: Emulator boot timeout"
+    return 1
+}
+
+wait_for_boot || exit 1
+
+# Enable ADB over TCP by setting the port
+# This tells adbd inside the emulator to also listen on TCP
+log "Enabling ADB over TCP on port $ADB_PORT..."
+adb shell setprop service.adb.tcp.port $ADB_PORT
+
+# Restart adbd to pick up the TCP port setting
+log "Restarting adbd to enable TCP mode..."
+adb shell stop adbd 2>/dev/null || true
+sleep 1
+adb shell start adbd
+
+# Give adbd time to restart and bind to the port
+sleep 3
+
+# Verify adbd is listening on the port inside the emulator
+log "Verifying adbd TCP listener inside emulator..."
+if adb shell netstat -tlnp 2>/dev/null | grep -q ":$ADB_PORT"; then
+    log "adbd is listening on port $ADB_PORT inside emulator"
+else
+    log "WARNING: Could not verify adbd TCP listener (netstat may not be available)"
+fi
+
+# Use socat to forward from container network interface to emulator's localhost:5555
+# The emulator binds adbd to its internal localhost, we bridge to container's network
+log "Starting socat bridge: 0.0.0.0:$ADB_PORT -> emulator adbd"
+
+# Forward external connections to the emulator's ADB
+# We need to forward to the emulator's internal IP or use localhost with adb forward
+# First, set up adb forward from localhost:5555 to the emulator's adbd
+adb forward tcp:$ADB_PORT tcp:$ADB_PORT || {
+    log "WARNING: adb forward failed, trying socat direct bridge"
+}
+
+# Now expose that forwarded port to the network
+socat TCP-LISTEN:$ADB_PORT,bind=0.0.0.0,reuseaddr,fork TCP:127.0.0.1:$ADB_PORT &
+SOCAT_PID=$!
+
+# Create ready marker
+echo "ready" > /tmp/adb-network-ready
+log "ADB Network Bridge ready - external clients can connect via: adb connect <hostname>:$ADB_PORT"
+
+# Monitor socat
+while kill -0 $SOCAT_PID 2>/dev/null; do
+    sleep 30
+done
+
+log "socat exited unexpectedly"
+exit 1

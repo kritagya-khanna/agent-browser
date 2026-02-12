@@ -26,6 +26,10 @@ export interface RefMap {
     name?: string;
     /** Index for disambiguation when multiple elements have same role+name */
     nth?: number;
+    /** Coordinate-based bounds from DualMode tree */
+    bounds?: { left: number; top: number; right: number; bottom: number };
+    /** CDP Node ID */
+    nodeId?: number;
   };
 }
 

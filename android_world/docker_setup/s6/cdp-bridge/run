@@ -1,0 +1,352 @@
+#!/bin/bash
+exec 2>&1
+set -eo pipefail
+
+# ============================================
+# CDP Bridge Service
+# Exposes Chrome DevTools Protocol to network
+# Supports Chrome and WootzApp browsers
+# ============================================
+
+INTERNAL_PORT=9222
+EXTERNAL_PORT=9224
+MAX_RETRIES=60
+
+# Browser selection: "chrome" or "wootzapp" (default: chrome)
+BROWSER=${BROWSER:-chrome}
+
+# Desktop mode option (set CHROME_DESKTOP_MODE=1 to enable)
+DESKTOP_MODE=${CHROME_DESKTOP_MODE:-0}
+
+log() { echo "[cdp-bridge] $(date '+%H:%M:%S') $*"; }
+
+# CDP socket name from environment (set in docker-compose.yml)
+# Falls back to chrome_devtools_remote for Chrome compatibility
+CDP_SOCKET_NAME=${CDP_SOCKET_NAME:-chrome_devtools_remote}
+
+# --- Browser Configuration ---
+# IMPORTANT: Both Chrome and WootzApp use /data/local/tmp/chrome-command-line
+# WootzApp is built with the same command line file path as Chrome.
+COMMAND_LINE_FILE="/data/local/tmp/chrome-command-line"
+
+case "$BROWSER" in
+    wootzapp|WootzApp|WOOTZAPP)
+        BROWSER_PACKAGE="org.chromium.chrome"
+        BROWSER_ACTIVITY="org.chromium.chrome/com.google.android.apps.chrome.Main"
+        BROWSER_NAME="WootzApp"
+        # WootzApp supports custom socket names via --remote-debugging-socket-name
+        USE_CUSTOM_SOCKET=true
+        ;;
+    chrome|Chrome|CHROME|*)
+        BROWSER_PACKAGE="com.android.chrome"
+        BROWSER_ACTIVITY="com.android.chrome/org.chromium.chrome.browser.ChromeTabbedActivity"
+        BROWSER_NAME="Chrome"
+        # Chrome always uses standard socket name (ignores --remote-debugging-socket-name)
+        CDP_SOCKET_NAME="chrome_devtools_remote"
+        USE_CUSTOM_SOCKET=false
+        ;;
+esac
+
+log "Browser: $BROWSER_NAME ($BROWSER_PACKAGE)"
+log "CDP Socket: $CDP_SOCKET_NAME"
+
+source /app/docker_setup/adb_guard.sh
+ensure_adb_ready
+
+DEVICE_READY_MARKER="/tmp/adb-device-ready"
+# Align with EMULATOR_TIMEOUT to handle slow cold boots
+MARKER_TIMEOUT=${MARKER_TIMEOUT:-${EMULATOR_TIMEOUT:-300}}
+marker_waited=0
+while [ ! -f "$DEVICE_READY_MARKER" ]; do
+    if [ $marker_waited -ge $MARKER_TIMEOUT ]; then
+        log "ERROR: Emulator readiness marker not found within ${MARKER_TIMEOUT}s"
+        exit 1
+    fi
+    log "Waiting for emulator readiness marker..."
+    sleep 2
+    marker_waited=$((marker_waited + 2))
+done
+
+# --- Verify browser is installed (fail-fast) ---
+verify_browser_installed() {
+    log "Verifying $BROWSER_NAME is installed..."
+
+    if adb shell "pm list packages $BROWSER_PACKAGE" 2>/dev/null | grep -q "$BROWSER_PACKAGE"; then
+        log "$BROWSER_NAME is installed"
+        return 0
+    else
+        log "============================================"
+        log "FATAL ERROR: $BROWSER_NAME is NOT installed!"
+        log "============================================"
+        log ""
+        log "BROWSER=$BROWSER is configured but package '$BROWSER_PACKAGE' was not found."
+        log ""
+        log "To fix this, either:"
+        log "  1. Install the APK: adb install /path/to/WootzApp-x86_64.apk"
+        log "  2. Or switch to Chrome: export BROWSER=chrome"
+        log ""
+        log "Available packages matching 'chrome' or 'wootz':"
+        adb shell "pm list packages" 2>/dev/null | grep -iE "chrome|wootz" || log "  (none found)"
+        log ""
+        log "Exiting with error..."
+        return 1
+    fi
+}
+
+# --- Exponential backoff helper ---
+wait_with_backoff() {
+    local max_attempts=$1
+    shift
+    local cmd="$*"
+    local attempt=0
+    local delay=0.5
+
+    while [ $attempt -lt $max_attempts ]; do
+        if eval "$cmd"; then
+            return 0
+        fi
+        attempt=$((attempt + 1))
+        sleep $delay
+        delay=$(echo "$delay * 1.5" | bc)
+        if [ $(echo "$delay > 5" | bc) -eq 1 ]; then
+            delay=5
+        fi
+    done
+    return 1
+}
+
+# --- Wait for emulator boot ---
+wait_for_emulator() {
+    log "Waiting for emulator boot..."
+    if wait_with_backoff $MAX_RETRIES 'adb shell getprop sys.boot_completed 2>/dev/null | grep -q "1"'; then
+        log "Emulator boot complete"
+        return 0
+    fi
+    log "ERROR: Emulator boot timeout"
+    return 1
+}
+
+# --- Ensure browser is running with remote debugging ---
+detect_cdp_socket() {
+    local sockets
+    # Guard grep with || true to prevent pipefail exit when no sockets exist yet
+    sockets=$(adb shell "cat /proc/net/unix" 2>/dev/null | awk '{print $8}' | sed 's/^@//' | (grep -E 'devtools' || true) | sort -u)
+
+    if [ -z "$sockets" ]; then
+        return 1
+    fi
+
+    if [ -n "${CDP_SOCKET_NAME:-}" ] && echo "$sockets" | grep -q "$CDP_SOCKET_NAME"; then
+        echo "$CDP_SOCKET_NAME"
+        return 0
+    fi
+
+    if echo "$sockets" | grep -q "chrome_devtools_remote"; then
+        echo "chrome_devtools_remote"
+        return 0
+    fi
+
+    echo "$sockets" | head -n1
+    return 0
+}
+
+ensure_browser() {
+    log "Ensuring $BROWSER_NAME is launched with remote debugging..."
+
+    # Force stop the browser to ensure it picks up command line flags
+    log "Stopping $BROWSER_NAME..."
+    adb shell "am force-stop $BROWSER_PACKAGE" 2>/dev/null || true
+    sleep 1
+
+    # NOTE: Do NOT use 'pm clear' - it prevents DevTools socket from being created
+    # The working version (58931b8) did not clear app data
+
+    # WootzApp-specific setup
+    if [ "$BROWSER_PACKAGE" = "com.wootzapp.web" ]; then
+        log "Adding WootzApp to deviceidle whitelist (required for network)..."
+        adb shell "dumpsys deviceidle whitelist +$BROWSER_PACKAGE"
+    fi
+
+    # Build command line flags - keep minimal like working commit (58931b8)
+    BROWSER_FLAGS="_ --disable-fre --no-default-browser-check --no-first-run --remote-debugging-port=9222"
+
+    # Add custom socket name for WootzApp (Chrome ignores this flag)
+    if [ "$USE_CUSTOM_SOCKET" = "true" ]; then
+        log "Using custom CDP socket: $CDP_SOCKET_NAME"
+        BROWSER_FLAGS="$BROWSER_FLAGS --remote-debugging-socket-name=$CDP_SOCKET_NAME"
+    fi
+
+    # Desktop mode flags
+    if [ "$DESKTOP_MODE" = "1" ]; then
+        log "Desktop mode ENABLED"
+        BROWSER_FLAGS="$BROWSER_FLAGS --force-device-scale-factor=1 --window-size=1920,1080"
+    fi
+
+    # Set command line flags
+    log "Setting command line flags in $COMMAND_LINE_FILE"
+    adb shell "echo '$BROWSER_FLAGS' > $COMMAND_LINE_FILE"
+    adb shell "chmod 666 $COMMAND_LINE_FILE"
+
+    # Launch browser
+    log "Starting $BROWSER_NAME..."
+    adb shell "am start -n $BROWSER_ACTIVITY -d about:blank"
+
+    # Give browser time to start and create DevTools socket
+    # (Working version 58931b8 used simple 8-second sleep)
+    log "Waiting for browser to initialize..."
+    sleep 8
+
+    local detected_socket=""
+    for _ in $(seq 1 5); do
+        detected_socket=$(detect_cdp_socket || true)
+        if [ -n "$detected_socket" ]; then
+            CDP_SOCKET_NAME="$detected_socket"
+            log "DevTools socket detected: $CDP_SOCKET_NAME"
+            return 0
+        fi
+        sleep 2
+    done
+
+    log "WARNING: DevTools socket not found"
+    return 1
+}
+
+# --- Setup ADB forward ---
+setup_adb_forward() {
+    log "Setting up ADB forward: tcp:$INTERNAL_PORT -> localabstract:$CDP_SOCKET_NAME"
+
+    adb forward --remove-all 2>/dev/null || true
+    sleep 1
+
+    if ! adb forward tcp:$INTERNAL_PORT localabstract:$CDP_SOCKET_NAME; then
+        log "ERROR: Failed to create ADB forward"
+        return 1
+    fi
+
+    log "ADB forward established"
+    return 0
+}
+
+# --- Wait for CDP to be responsive ---
+wait_for_cdp() {
+    log "Waiting for CDP to be responsive..."
+    local max_cdp_retries=30
+
+    if wait_with_backoff $max_cdp_retries \
+        'curl -s --max-time 2 -H "Host: localhost" "http://127.0.0.1:'"$INTERNAL_PORT"'/json/version" >/dev/null 2>&1'; then
+        log "CDP is responsive!"
+
+        # Log browser version
+        VERSION=$(curl -s "http://127.0.0.1:$INTERNAL_PORT/json/version" | grep -o '"Browser":"[^"]*"' | cut -d'"' -f4)
+        log "Connected to: $VERSION"
+        return 0
+    fi
+
+    log "ERROR: CDP timeout"
+    return 1
+}
+
+# --- Cleanup handler ---
+cleanup() {
+    log "Cleaning up..."
+    adb forward --remove-all 2>/dev/null || true
+    exit 0
+}
+
+trap cleanup SIGTERM SIGINT
+
+# --- Setup everything and return success if CDP is working ---
+setup_cdp() {
+    ensure_browser || return 1
+    setup_adb_forward || return 1
+    wait_for_cdp || return 1
+    return 0
+}
+
+# --- Wait for APK installation to complete ---
+wait_for_apk_install() {
+    local marker="/tmp/install-apks-done"
+    local fail_marker="/tmp/install-apks-failed"
+    local max_wait=300
+    local waited=0
+
+    log "Waiting for APK installation to complete..."
+    while [ ! -f "$marker" ] && [ $waited -lt $max_wait ]; do
+        if [ -f "$fail_marker" ]; then
+            log "ERROR: APK installation failed (marker $fail_marker present)"
+            return 1
+        fi
+        sleep 2
+        waited=$((waited + 2))
+    done
+
+    if [ -f "$marker" ]; then
+        log "APK installation complete"
+        return 0
+    elif [ -f "$fail_marker" ]; then
+        log "ERROR: APK installation failed (marker $fail_marker present)"
+        return 1
+    else
+        log "WARNING: APK installation did not complete within ${max_wait}s, continuing anyway..."
+        return 0
+    fi
+}
+
+# --- Main Execution ---
+log "CDP Bridge Service starting..."
+log "Browser selection: $BROWSER_NAME"
+
+wait_for_emulator || exit 1
+wait_for_apk_install || exit 1
+verify_browser_installed || exit 1
+
+# Try to setup CDP with retries
+MAX_SETUP_RETRIES=5
+for attempt in $(seq 1 $MAX_SETUP_RETRIES); do
+    log "Setup attempt $attempt/$MAX_SETUP_RETRIES..."
+    if setup_cdp; then
+        log "CDP setup successful on attempt $attempt"
+        break
+    fi
+    if [ $attempt -eq $MAX_SETUP_RETRIES ]; then
+        log "FATAL: CDP setup failed after $MAX_SETUP_RETRIES attempts"
+        exit 1
+    fi
+    log "Retrying in 5 seconds..."
+    sleep 5
+done
+
+# Create ready indicator file with browser info
+echo "$BROWSER_NAME" > /tmp/cdp-bridge-ready
+log "CDP Bridge ready ($BROWSER_NAME)"
+
+log "Starting socat bridge: 0.0.0.0:$EXTERNAL_PORT -> 127.0.0.1:$INTERNAL_PORT"
+
+# Run socat in background and monitor CDP health
+socat TCP-LISTEN:$EXTERNAL_PORT,bind=0.0.0.0,reuseaddr,fork TCP:127.0.0.1:$INTERNAL_PORT &
+SOCAT_PID=$!
+
+# Monitor CDP health - restart browser if it dies
+while kill -0 $SOCAT_PID 2>/dev/null; do
+    sleep 10
+    if ! curl -s --max-time 2 "http://127.0.0.1:$INTERNAL_PORT/json/version" >/dev/null 2>&1; then
+        log "WARNING: CDP health check failed, restarting browser..."
+
+        # Kill socat
+        kill $SOCAT_PID 2>/dev/null || true
+        wait $SOCAT_PID 2>/dev/null || true
+
+        # Restart CDP setup
+        if setup_cdp; then
+            log "CDP recovered, restarting socat..."
+            socat TCP-LISTEN:$EXTERNAL_PORT,bind=0.0.0.0,reuseaddr,fork TCP:127.0.0.1:$INTERNAL_PORT &
+            SOCAT_PID=$!
+        else
+            log "FATAL: CDP recovery failed"
+            exit 1
+        fi
+    fi
+done
+
+log "socat exited unexpectedly"
+exit 1

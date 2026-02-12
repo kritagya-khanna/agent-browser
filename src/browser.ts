@@ -18,7 +18,8 @@ import path from 'node:path';
 import os from 'node:os';
 import { existsSync, mkdirSync, rmSync } from 'node:fs';
 import type { LaunchCommand } from './types.js';
-import { type RefMap, type EnhancedSnapshot, getEnhancedSnapshot, parseRef } from './snapshot.js';
+import { type RefMap, type EnhancedSnapshot, parseRef } from './snapshot.js';
+import { getDualModeSnapshot } from './taxtree.js';
 
 // Screencast frame data from CDP
 export interface ScreencastFrame {
@@ -121,7 +122,8 @@ export class BrowserManager {
     selector?: string;
   }): Promise<EnhancedSnapshot> {
     const page = this.getPage();
-    const snapshot = await getEnhancedSnapshot(page, options);
+    // Use DualMode AXTree (WootzApp) instead of Playwright's ariaSnapshot
+    const snapshot = await getDualModeSnapshot(page, options);
     this.refMap = snapshot.refs;
     this.lastSnapshot = snapshot.tree;
     return snapshot;
@@ -175,6 +177,15 @@ export class BrowserManager {
    */
   isRef(selector: string): boolean {
     return parseRef(selector) !== null;
+  }
+
+  /**
+   * Get raw ref data (including bounds/nodeId)
+   */
+  getRefData(refArg: string): RefMap[string] | null {
+    const ref = parseRef(refArg);
+    if (!ref) return null;
+    return this.refMap[ref] || null;
   }
 
   /**

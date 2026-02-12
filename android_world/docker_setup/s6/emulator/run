@@ -1,0 +1,5 @@
+#!/bin/bash
+exec 2>&1
+echo "[emulator] Starting emulator service via start_emu_headless.sh..."
+# We run the headless script directly. It now runs in foreground.
+exec /app/docker_setup/start_emu_headless.sh

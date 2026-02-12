@@ -1,0 +1,47 @@
+services:
+  # ---------------------------------------------------------------------------
+  # Android Emulator Service (The "Body")
+  # ---------------------------------------------------------------------------
+  android-service:
+    build:
+      context: ./android_world
+      dockerfile: Dockerfile
+    image: agent-browser-android-prod
+    privileged: true # Required for KVM
+    restart: always  # Auto-restart on crash
+    ports:
+      - "5556:5555" # ADB (Host access)
+      - "9225:9224" # CDP (Host access)
+      - "6081:6080" # NoVNC
+    environment:
+      - EMULATOR_NAME=Pixel_6_API_34
+      - BROWSER=wootzapp
+      - EMULATOR_ACCEL=1
+    devices:
+      - /dev/kvm:/dev/kvm
+    # Robust healthcheck ensuring browser is responsive
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9224/json/version"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 60s
+
+  # ---------------------------------------------------------------------------
+  # Agent Browser Service (The "Brain")
+  # ---------------------------------------------------------------------------
+  agent-service:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.agent-prod
+    image: agent-browser-agent-prod
+    restart: always
+    depends_on:
+      - android-service
+    ports:
+      - "3000:3000" # Agent Control Port
+    environment:
+      - AGENT_DEBUG=false
+      - AGENT_BROWSER_SOCKET_DIR=/tmp/agent-browser
+    links:
+      - android-service

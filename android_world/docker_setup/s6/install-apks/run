@@ -1,0 +1,161 @@
+#!/bin/bash
+exec 2>&1
+
+APK_DIR="/android/apks"
+MARKER_FILE="/tmp/install-apks-done"
+FAIL_MARKER="/tmp/install-apks-failed"
+
+BROWSER=${BROWSER:-chrome}
+REQUIRE_WOOTZAPP=0
+if echo "$BROWSER" | grep -qi "wootzapp"; then
+    REQUIRE_WOOTZAPP=1
+fi
+
+REQUIRED_PACKAGE="org.chromium.chrome"
+
+# Prevent re-running (s6-overlay v3 oneshot workaround)
+if [ -f "$MARKER_FILE" ]; then
+    echo "[install-apks] Already completed, sleeping indefinitely..."
+    exec sleep infinity
+fi
+
+echo "[install-apks] APK installation service starting..."
+
+source /app/docker_setup/adb_guard.sh
+ensure_adb_ready
+
+rm -f "$FAIL_MARKER"
+
+DEVICE_READY_MARKER="/tmp/adb-device-ready"
+echo "[install-apks] Waiting for emulator readiness marker..."
+timeout=${MARKER_TIMEOUT:-${EMULATOR_TIMEOUT:-300}}
+elapsed=0
+
+while [ $elapsed -lt $timeout ]; do
+    if [ -f "$DEVICE_READY_MARKER" ]; then
+        echo "[install-apks] Emulator booted successfully"
+        break
+    fi
+    sleep 2
+    elapsed=$((elapsed + 2))
+done
+
+if [ ! -f "$DEVICE_READY_MARKER" ]; then
+    echo "[install-apks] ERROR: Emulator did not boot within ${timeout}s"
+    exit 1
+fi
+
+# Wait for device to be online with timeout
+echo "[install-apks] Waiting for device to be online (max 120s)..."
+if ! timeout 120 adb wait-for-device; then
+    echo "[install-apks] WARNING: Device did not come online within timeout"
+    if [ "$REQUIRE_WOOTZAPP" -eq 1 ]; then
+        echo "[install-apks] ERROR: WootzApp required but device not available"
+        touch "$FAIL_MARKER"
+        exit 1
+    fi
+    touch "$MARKER_FILE"
+    exec sleep infinity
+fi
+
+echo "[install-apks] Device is online"
+
+# Wait a bit more for system to stabilize
+sleep 5
+
+# Check if APK directory exists and has APKs
+if [ ! -d "$APK_DIR" ]; then
+    if [ "$REQUIRE_WOOTZAPP" -eq 1 ]; then
+        echo "[install-apks] ERROR: APK directory missing; WootzApp is required"
+        touch "$FAIL_MARKER"
+        exit 1
+    fi
+    echo "[install-apks] No APK directory found at $APK_DIR, skipping"
+    touch "$MARKER_FILE"
+    echo "[install-apks] Marked as complete, sleeping indefinitely..."
+    exec sleep infinity
+fi
+
+apk_count=$(find "$APK_DIR" -name "*.apk" 2>/dev/null | wc -l)
+if [ "$apk_count" -eq 0 ]; then
+    if [ "$REQUIRE_WOOTZAPP" -eq 1 ]; then
+        echo "[install-apks] ERROR: No APK files found; WootzApp is required"
+        touch "$FAIL_MARKER"
+        exit 1
+    fi
+    echo "[install-apks] No APK files found in $APK_DIR, skipping"
+    touch "$MARKER_FILE"
+    echo "[install-apks] Marked as complete, sleeping indefinitely..."
+    exec sleep infinity
+fi
+
+echo "[install-apks] Found $apk_count APK(s) to install"
+
+# Install each APK
+installed=0
+failed=0
+
+# 1. Install regular APKs (single files in root directory)
+for apk in "$APK_DIR"/*.apk; do
+    if [ -f "$apk" ]; then
+        apk_name=$(basename "$apk")
+        echo "[install-apks] Installing $apk_name..."
+
+        # Install with replace flag, allow downgrades
+        if timeout 60 adb install -r -d "$apk" 2>&1; then
+            echo "[install-apks] SUCCESS: $apk_name installed"
+            installed=$((installed + 1))
+        else
+            echo "[install-apks] FAILED: $apk_name installation failed"
+            failed=$((failed + 1))
+        fi
+    fi
+done
+
+# 2. Install split APKs (directories containing multiple APKs from XAPK bundles)
+for dir in "$APK_DIR"/*/; do
+    if [ -d "$dir" ]; then
+        dir_name=$(basename "$dir")
+        split_apks=$(find "$dir" -maxdepth 1 -name "*.apk" 2>/dev/null)
+
+        if [ -n "$split_apks" ]; then
+            echo "[install-apks] Installing split APK bundle: $dir_name"
+
+            # Build list of APK files for install-multiple
+            apk_list=""
+            for split in "$dir"/*.apk; do
+                if [ -f "$split" ]; then
+                    apk_list="$apk_list $split"
+                fi
+            done
+
+            # Install split APKs with install-multiple
+            if timeout 120 adb install-multiple -r -d $apk_list 2>&1; then
+                echo "[install-apks] SUCCESS: $dir_name split APK bundle installed"
+                installed=$((installed + 1))
+            else
+                echo "[install-apks] FAILED: $dir_name split APK bundle installation failed"
+                failed=$((failed + 1))
+            fi
+        fi
+    fi
+done
+
+echo "[install-apks] Installation complete: $installed succeeded, $failed failed"
+
+if [ "$REQUIRE_WOOTZAPP" -eq 1 ]; then
+    if ! adb shell "pm list packages $REQUIRED_PACKAGE" 2>/dev/null | grep -q "$REQUIRED_PACKAGE"; then
+        echo "[install-apks] ERROR: Required package $REQUIRED_PACKAGE is not installed"
+        echo "[install-apks] All third-party packages:"
+        adb shell "pm list packages -3" || true
+        touch "$FAIL_MARKER"
+        exit 1
+    fi
+fi
+
+# Mark as done to prevent re-running
+touch "$MARKER_FILE"
+echo "[install-apks] Marked as complete, sleeping indefinitely..."
+
+# Sleep forever instead of exit to prevent s6 restart
+exec sleep infinity

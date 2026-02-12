@@ -1,0 +1,526 @@
+# docker-compose.ray.yml
+# Ray cluster for W8-RL distributed rollout with visual rewards
+#
+# Architecture (per ROLLOUT.md):
+#   - ray-head: Ray GCS + Dashboard (singleton)
+#   - coordinator: Launches EnvMaster, TrainerActor, and spawns workers
+#   - ray-worker-N: Runs EnvActors + InferenceRouter (colocated via placement groups)
+#   - android-sidecar-N: Android emulator per worker node for ChromiumRL
+#
+# Usage:
+#   # Start cluster
+#   docker compose -f docker-compose.ray.yml up -d ray-head ray-worker-0 android-sidecar-0
+#
+#   # Run rollout coordinator
+#   docker compose -f docker-compose.ray.yml run coordinator \
+#     python -m w8_rl.rollout.coordinator_main --workers-per-node 4
+#
+#   # View dashboard
+#   open http://localhost:8265
+#
+# Scaling:
+#   docker compose -f docker-compose.ray.yml --profile multi-worker up -d
+
+services:
+  # ============================================
+  # Ray Head Node
+  # ============================================
+  ray-head:
+    build:
+      context: .
+      dockerfile: Dockerfile.ray-worker
+    container_name: ray-head
+    hostname: ray-head
+    # Shared memory for Ray object store (critical for performance)
+    shm_size: '4gb'
+    # Add docker group for socket access (detect with: stat -c '%g' /var/run/docker.sock)
+    group_add:
+      - "${DOCKER_GID:-118}"  # Docker socket GID on host (override with DOCKER_GID env var)
+    command: >
+      bash -c "
+        ray start --head --port=6379 --ray-client-server-port=10001 --dashboard-host=0.0.0.0 --dashboard-port=8265 --block
+      "
+    ports:
+      - "6379:6379"      # Ray GCS port
+      - "10001:10001"    # Ray client server port
+      - "8265:8265"      # Ray dashboard
+    volumes:
+      # Docker socket for spawning task containers
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Shared storage for checkpoints
+      - ./data:/home/ray/app/data
+      - ./checkpoints:/home/ray/app/checkpoints
+      - ./configs:/home/ray/app/configs
+      - ./tasks:/home/ray/app/tasks
+      - ./w8_storage:/home/ray/app/w8_storage
+      - ./output:/home/ray/app/output
+      # Secrets
+      - ./secrets:/home/ray/app/secrets:ro
+      - rollout-screenshots:/tmp/rollout/screenshots
+    environment:
+      - RAY_ADDRESS=auto
+      - RAY_NAMESPACE=w8rl
+      - DOCKER_BUILDKIT=1
+      - GOOGLE_APPLICATION_CREDENTIALS=/home/ray/app/secrets/gcp-service-account.json
+      - WANDB_API_KEY=${WANDB_API_KEY:-}
+      - TINKER_API_KEY=${TINKER_API_KEY}
+      # Use android-world for standalone mode (default), android-sidecar-0 for cluster mode
+      - CDP_URL=${CDP_URL:-ws://android-world:9224}
+      - ADB_HOST=${ADB_HOST:-android-world:5555}
+      - ANDROID_CONTAINER=${ANDROID_CONTAINER:-android-world}
+      # Host project directory for sibling container volume mounts
+      - HOST_PROJECT_DIR=${PWD}
+    # NOTE: Ray head does NOT depend on android-sidecar-0
+    # In standalone mode, android-world is used instead (managed by run_all_tasks.sh)
+    # In cluster mode, workers depend on their respective android sidecars
+    networks:
+      - ray-w8-rl
+    healthcheck:
+      test: ["CMD", "ray", "status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ============================================
+  # CLIP Server (Dedicated Visual Similarity Service)
+  # ============================================
+  # Singleton CLIP model server that serves all training workers
+  # - Pre-downloads CLIP model at build time (no runtime download)
+  # - Connects to Ray cluster and registers as detached actor
+  # - One instance serves all ray-worker containers
+  clip-server:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.clip-server
+    image: rollout-clip-server
+    container_name: clip-server
+    hostname: clip-server
+    shm_size: '2gb'
+    environment:
+      # MUST use Ray client protocol for cross-container connections
+      - RAY_ADDRESS=ray://ray-head:10001
+      - RAY_NAMESPACE=w8rl
+    depends_on:
+      ray-head:
+        condition: service_healthy
+    networks:
+      - ray-w8-rl
+    healthcheck:
+      test: ["CMD", "python", "-c", "import ray; ray.init(address='ray://ray-head:10001', namespace='w8rl'); ray.get_actor('clip_server', namespace='w8rl')"]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 60s
+    profiles:
+      - standalone
+      - cluster
+
+  # ============================================
+  # NodeManager Daemon
+  # ============================================
+  # Async Docker capacity manager for Ray workers (FastAPI + aiodocker)
+  # Manages worker container lifecycle, health checks, and reconciliation
+  nodemanager:
+    build:
+      context: .
+      dockerfile: Dockerfile.ray-worker
+    container_name: nodemanager
+    hostname: nodemanager
+    command: >
+      bash -c "
+        python -m w8_rl.nodemanager.api
+      "
+    ports:
+      - "8300:8300"      # NodeManager API
+    volumes:
+      # Docker socket for managing worker containers
+      - /var/run/docker.sock:/var/run/docker.sock
+      # State persistence
+      - ./data/nodemanager:/home/ray/app/data/nodemanager
+    environment:
+      - NODEMANAGER_HOST=0.0.0.0
+      - NODEMANAGER_PORT=8300
+      - DOCKER_NETWORK=ray-w8-rl
+      - RAY_HEAD_ADDRESS=ray-head:6379
+      - MAX_WORKERS=10
+      - STATE_FILE=/home/ray/app/data/nodemanager/state.json
+    group_add:
+      - "${DOCKER_GID:-118}"
+    networks:
+      - ray-w8-rl
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8300/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ============================================
+  # Rollout Coordinator
+  # ============================================
+  # Orchestrates EnvMaster, TrainerActor, and spawns workers via placement groups
+  coordinator:
+    build:
+      context: .
+      dockerfile: Dockerfile.ray-worker
+    container_name: coordinator
+    hostname: coordinator
+    shm_size: '4gb'
+    group_add:
+      - "${DOCKER_GID:-118}"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./tasks:/home/ray/app/tasks
+      - ./data:/home/ray/app/data
+      - ./output:/home/ray/app/output
+      - ./secrets:/home/ray/app/secrets:ro
+      - rollout-screenshots:/tmp/rollout/screenshots  # Shared screenshot storage
+    environment:
+      - RAY_ADDRESS=ray-head:6379
+      - RAY_NAMESPACE=w8rl
+      - DOCKER_NETWORK=ray-w8-rl
+      - DOCKER_BUILDKIT=1
+      - GOOGLE_APPLICATION_CREDENTIALS=/home/ray/app/secrets/gcp-service-account.json
+      - HOST_PROJECT_DIR=${PWD}
+      - NODEMANAGER_URL=http://nodemanager:8300
+    depends_on:
+      ray-head:
+        condition: service_healthy
+      nodemanager:
+        condition: service_healthy
+    networks:
+      - ray-w8-rl
+    profiles:
+      - coordinator
+
+  # ============================================
+  # Ray Worker 0 + Android Sidecar
+  # ============================================
+  # Standalone worker for testing (run with: docker compose run ray-worker)
+  ray-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.ray-worker
+    image: rollout-ray-worker
+    container_name: ray-worker
+    hostname: ray-worker
+    # Add docker group for socket access (detect with: stat -c '%g' /var/run/docker.sock)
+    group_add:
+      - "${DOCKER_GID:-118}"  # Docker socket GID on host (override with DOCKER_GID env var)
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./tasks:/home/ray/app/tasks
+      - ./w8_storage:/home/ray/app/w8_storage
+      - ./data:/home/ray/app/data
+      - ./output:/home/ray/app/output
+      - ./secrets:/home/ray/app/secrets:ro
+      # Mount source code for development (avoid rebuilding)
+      - ./w8_rl:/home/ray/app/w8_rl:ro
+      - ./scripts:/home/ray/app/scripts:ro
+    environment:
+      # MUST use Ray client protocol for standalone workers that don't join the cluster
+      # GCS address (ray-head:6379) only works if container has done "ray start --address=..."
+      # ray:// protocol allows external containers to connect without joining
+      - RAY_ADDRESS=ray://ray-head:10001
+      - RAY_NAMESPACE=w8rl
+      - CDP_URL=ws://android-world:9224
+      - ADB_HOST=android-world:5555
+      - ANDROID_CONTAINER=android-world
+      - DOCKER_NETWORK=ray-w8-rl
+      - W8_RL_TASKS_DIR=/home/ray/app/tasks
+      - DOCKER_BUILDKIT=1
+      - GOOGLE_APPLICATION_CREDENTIALS=/home/ray/app/secrets/gcp-service-account.json
+      - TINKER_API_KEY=${TINKER_API_KEY}
+      # Host project directory for sibling container mounts
+      - HOST_PROJECT_DIR=${PWD}
+    networks:
+      - ray-w8-rl
+    profiles:
+      - standalone
+
+  # Standalone Tinker worker (inherits from ray-worker image)
+  # Run with: docker compose run ray-worker-tinker
+  ray-worker-tinker:
+    build:
+      context: .
+      dockerfile: Dockerfile.ray-worker
+      target: ray-worker-tinker
+    image: rollout-ray-worker-tinker
+    container_name: ray-worker-tinker
+    hostname: ray-worker-tinker
+    # Add docker group for socket access (detect with: stat -c '%g' /var/run/docker.sock)
+    group_add:
+      - "${DOCKER_GID:-118}"  # Docker socket GID on host (override with DOCKER_GID env var)
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./tasks:/home/ray/app/tasks
+      - ./data:/home/ray/app/data
+      - ./output:/home/ray/app/output
+      - ./secrets:/home/ray/app/secrets:ro
+      # Mount source code for development (avoid rebuilding)
+      - ./w8_rl:/home/ray/app/w8_rl:ro
+    environment:
+      # MUST use Ray client protocol for standalone workers that don't join the cluster
+      - RAY_ADDRESS=ray://ray-head:10001
+      - RAY_NAMESPACE=w8rl
+      - CDP_URL=ws://android-world:9224
+      - ADB_HOST=android-world:5555
+      - ANDROID_CONTAINER=android-world
+      - DOCKER_NETWORK=ray-w8-rl
+      - W8_RL_TASKS_DIR=/home/ray/app/tasks
+      - DOCKER_BUILDKIT=1
+      - GOOGLE_APPLICATION_CREDENTIALS=/home/ray/app/secrets/gcp-service-account.json
+      - TINKER_API_KEY=${TINKER_API_KEY}
+      # Host project directory for sibling container mounts
+      - HOST_PROJECT_DIR=${PWD}
+    networks:
+      - ray-w8-rl
+    profiles:
+      - standalone
+
+  ray-worker-0:
+    build:
+      context: .
+      dockerfile: Dockerfile.ray-worker
+    container_name: ray-worker-0
+    hostname: ray-worker-0
+    shm_size: '4gb'
+    # Add docker group for socket access (detect with: stat -c '%g' /var/run/docker.sock)
+    group_add:
+      - "${DOCKER_GID:-118}"  # Docker socket GID on host (override with DOCKER_GID env var)
+    command: >
+      bash -c "
+        ray start --address=ray-head:6379 --block
+      "
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./tasks:/home/ray/app/tasks
+      - ./data:/home/ray/app/data
+      - ./checkpoints:/home/ray/app/checkpoints
+      - ./secrets:/home/ray/app/secrets:ro
+      - rollout-screenshots:/tmp/rollout/screenshots  # Shared screenshot storage for locality
+    environment:
+      - RAY_ADDRESS=ray-head:6379
+      - RAY_NAMESPACE=w8rl
+      - CDP_URL=http://android-sidecar-0:9224
+      - ANDROID_CONTAINER=android-sidecar-0
+      - DOCKER_NETWORK=ray-w8-rl
+      - W8_RL_TASKS_DIR=/home/ray/app/tasks
+      - DOCKER_BUILDKIT=1
+      - GOOGLE_APPLICATION_CREDENTIALS=/home/ray/app/secrets/gcp-service-account.json
+      # Host project directory for sibling container volume mounts
+      - HOST_PROJECT_DIR=${PWD}
+    depends_on:
+      ray-head:
+        condition: service_healthy
+      android-sidecar-0:
+        condition: service_healthy
+    networks:
+      - ray-w8-rl
+    profiles:
+      - cluster  # Only start with: docker compose --profile cluster up
+
+  # ============================================
+  # Android Emulator (shared base config)
+  # ============================================
+  # Used by both standalone (android-world) and cluster (android-sidecar-0) profiles
+  android-sidecar-0: &android-base
+    build:
+      context: ./android_world
+      dockerfile: Dockerfile
+    container_name: android-sidecar-0
+    hostname: android-sidecar-0
+    privileged: true
+    devices:
+      - /dev/kvm:/dev/kvm
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    ports:
+      - "9224:9224"      # CDP port
+      - "5554:5554"      # Emulator console port
+      - "5555:5555"      # ADB TCP port (for remote adb connect)
+      - "4723:4723"      # Appium server port
+    environment:
+      - BROWSER=wootzapp
+      - CDP_PORT=9224
+      - CDP_SOCKET_NAME=wootzapp_world_devtools
+      - EMULATOR_SNAPSHOT_ENABLE=${EMULATOR_SNAPSHOT_ENABLE:-1}
+      - EMULATOR_SNAPSHOT_NAME=${EMULATOR_SNAPSHOT_NAME:-w8rl_golden}
+      - EMULATOR_REHYDRATE_AVD=${EMULATOR_REHYDRATE_AVD:-1}
+      - EMULATOR_WIPE_DATA=${EMULATOR_WIPE_DATA:-0}
+      - ANDROID_AVD_HOME=/root/.android/avd
+      - ANDROID_SDK_HOME=/root/.android
+      # Appium server configuration
+      - APPIUM=true
+      - RELAXED_SECURITY=true
+      # Emulator optimization flags (GPU mode for Quick Boot compatibility)
+      - EMULATOR_EXTRA_FLAGS=${EMULATOR_EXTRA_FLAGS:--gpu swiftshader_indirect -dns-server 8.8.8.8}
+    networks:
+      - ray-w8-rl
+    volumes:
+      - android-dot-android:/root/.android
+      - android-emulator:/root/android_emulator
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9224/json/version"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+    profiles:
+      - cluster  # Only start with: docker compose --profile cluster up
+
+  # ============================================
+  # Ray Worker 1 + Android Sidecar (scale up as needed)
+  # ============================================
+  ray-worker-1:
+    build:
+      context: .
+      dockerfile: Dockerfile.ray-worker
+    container_name: ray-worker-1
+    hostname: ray-worker-1
+    # Add docker group for socket access (detect with: stat -c '%g' /var/run/docker.sock)
+    group_add:
+      - "${DOCKER_GID:-118}"  # Docker socket GID on host (override with DOCKER_GID env var)
+    command: >
+      bash -c "
+        ray start --address=ray-head:6379 --block
+      "
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./data:/home/ray/app/data
+      - ./checkpoints:/home/ray/app/checkpoints
+      - ./secrets:/home/ray/app/secrets:ro
+      - rollout-screenshots:/tmp/rollout/screenshots  # Shared screenshot storage for locality
+    environment:
+      - RAY_ADDRESS=ray-head:6379
+      - RAY_NAMESPACE=w8rl
+      - CDP_URL=http://android-sidecar-1:9224
+      - ANDROID_CONTAINER=android-sidecar-1
+      - DOCKER_BUILDKIT=1
+      - GOOGLE_APPLICATION_CREDENTIALS=/home/ray/app/secrets/gcp-service-account.json
+    depends_on:
+      ray-head:
+        condition: service_healthy
+      android-sidecar-1:
+        condition: service_healthy
+    networks:
+      - ray-w8-rl
+    profiles:
+      - multi-worker  # Only start with: docker compose --profile multi-worker up
+
+  android-sidecar-1:
+    build:
+      context: ./android_world
+      dockerfile: Dockerfile
+    container_name: android-sidecar-1
+    hostname: android-sidecar-1
+    privileged: true
+    devices:
+      - /dev/kvm:/dev/kvm
+    ports:
+      - "9225:9224"      # CDP port (different host port)
+      - "5555:5554"      # ADB port (different host port)
+    environment:
+      - BROWSER=wootzapp
+      - CDP_PORT=9224
+      - CDP_SOCKET_NAME=wootzapp_world_devtools
+    networks:
+      - ray-w8-rl
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9224/json/version"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+    profiles:
+      - multi-worker
+
+  # ============================================
+  # Design2Code Ground Truth Evaluation
+  # ============================================
+  design2code-eval:
+    build:
+      context: ./docker/design2code-eval
+      dockerfile: Dockerfile
+    image: design2code-eval:latest
+    container_name: design2code-eval
+    networks:
+      - ray-w8-rl
+    profiles:
+      - eval  # Build with: docker compose --profile eval build design2code-eval
+
+  # ============================================
+  # Android Emulators for standalone testing
+  # ============================================
+  # Standalone emulator with host networking for internet access
+  android-world-rebuilt:
+    build:
+      context: ./android_world
+      dockerfile: Dockerfile
+    container_name: android-world-rebuilt
+    hostname: android-world-rebuilt
+    privileged: true
+    devices:
+      - /dev/kvm:/dev/kvm
+    # Host networking allows emulator to use host's internet/DNS
+    network_mode: host
+    environment:
+      - BROWSER=wootzapp
+      - CDP_PORT=9224
+      - CDP_SOCKET_NAME=wootzapp_world_devtools
+      - EMULATOR_SNAPSHOT_ENABLE=${EMULATOR_SNAPSHOT_ENABLE:-1}
+      - EMULATOR_SNAPSHOT_NAME=${EMULATOR_SNAPSHOT_NAME:-w8rl_golden}
+      - EMULATOR_REHYDRATE_AVD=${EMULATOR_REHYDRATE_AVD:-1}
+      - EMULATOR_WIPE_DATA=${EMULATOR_WIPE_DATA:-0}
+      - ANDROID_AVD_HOME=/root/.android/avd
+      - ANDROID_SDK_HOME=/root/.android
+      - APPIUM=true
+      - RELAXED_SECURITY=true
+      - EMULATOR_EXTRA_FLAGS=${EMULATOR_EXTRA_FLAGS:--gpu swiftshader_indirect -dns-server 8.8.8.8}
+    volumes:
+      - android-dot-android:/root/.android
+      - android-emulator:/root/android_emulator
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9224/json/version"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+    profiles:
+      - standalone
+
+  # Second Android emulator for parallel rollouts with full isolation
+  android-world-1:
+    <<: *android-base
+    container_name: android-world-1
+    hostname: android-world-1
+    ports:
+      - "9225:9224"      # CDP port (different host port)
+      - "5556:5554"      # ADB port (different host port)
+    volumes:
+      - android-dot-android-1:/root/.android
+      - android-emulator-1:/root/android_emulator
+    profiles:
+      - standalone
+      - multi-emulator
+
+volumes:
+  # Shared screenshot storage for InferenceRouter locality
+  # All EnvActors write screenshots here; colocated InferenceRouter reads them
+  rollout-screenshots:
+    driver: local
+  # Persist AVD data and emulator state for quickboot snapshots
+  android-dot-android:
+    driver: local
+  android-emulator:
+    driver: local
+  # Second emulator volumes (for parallel isolation)
+  android-dot-android-1:
+    driver: local
+  android-emulator-1:
+    driver: local
+
+networks:
+  ray-w8-rl:
+    name: ray-w8-rl
+    driver: bridge

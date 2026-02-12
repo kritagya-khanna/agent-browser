@@ -325,6 +325,7 @@ export async function startDaemon(options?: {
                 proxy,
                 ignoreHTTPSErrors: ignoreHTTPSErrors,
                 allowFileAccess: allowFileAccess,
+                cdpUrl: process.env.AGENT_BROWSER_CDP_URL,
               });
             }
           }

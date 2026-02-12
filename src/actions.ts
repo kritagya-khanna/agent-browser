@@ -497,7 +497,35 @@ async function handleNavigate(
 }
 
 async function handleClick(command: ClickCommand, browser: BrowserManager): Promise<Response> {
-  // Support both refs (@e1) and regular selectors
+  // 1. Check if this is a ref with coordinate bounds
+  if (browser.isRef(command.selector)) {
+    const refData = browser.getRefData(command.selector);
+    if (refData && refData.bounds) {
+      const b = refData.bounds;
+      // Calculate center of the bounds
+      const centerX = b.left + (b.right - b.left) / 2;
+      const centerY = b.top + (b.bottom - b.top) / 2;
+
+      // Inject raw mouse events via CDP
+      await browser.injectMouseEvent({
+        type: 'mousePressed',
+        x: centerX,
+        y: centerY,
+        button: command.button || 'left',
+        clickCount: command.clickCount || 1,
+      });
+      await browser.injectMouseEvent({
+        type: 'mouseReleased',
+        x: centerX,
+        y: centerY,
+        button: command.button || 'left',
+      });
+
+      return successResponse(command.id, { clicked: true, method: 'cdp_coordinates' });
+    }
+  }
+
+  // 2. Fallback to standard Playwright locator click
   const locator = browser.getLocator(command.selector);
 
   try {
@@ -510,7 +538,7 @@ async function handleClick(command: ClickCommand, browser: BrowserManager): Prom
     throw toAIFriendlyError(error, command.selector);
   }
 
-  return successResponse(command.id, { clicked: true });
+  return successResponse(command.id, { clicked: true, method: 'playwright_locator' });
 }
 
 async function handleType(command: TypeCommand, browser: BrowserManager): Promise<Response> {

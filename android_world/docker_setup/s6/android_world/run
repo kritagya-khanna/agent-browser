@@ -1,0 +1,52 @@
+#!/bin/bash
+exec 2>&1
+
+echo "[android_world] Waiting for emulator to be ready..."
+
+source /app/docker_setup/adb_guard.sh
+ensure_adb_ready
+
+DEVICE_READY_MARKER="/tmp/adb-device-ready"
+MARKER_TIMEOUT=${MARKER_TIMEOUT:-${EMULATOR_TIMEOUT:-300}}
+marker_waited=0
+while [ ! -f "$DEVICE_READY_MARKER" ]; do
+    if [ $marker_waited -ge $MARKER_TIMEOUT ]; then
+        echo "[android_world] ERROR: Emulator readiness marker not found within ${MARKER_TIMEOUT}s"
+        exit 1
+    fi
+    echo "[android_world] Waiting for emulator readiness marker..."
+    sleep 2
+    marker_waited=$((marker_waited + 2))
+done
+
+echo "[android_world] Emulator is ready!"
+
+# --- Setup Steps from original entrypoint ---
+echo "[android_world] Running setup steps..."
+
+# Wait for ADB device with timeout (don't hang forever)
+echo "[android_world] Waiting for device to be online (max 120s)..."
+timeout 120 adb wait-for-device || {
+    echo "[android_world] WARNING: Device did not come online within timeout, continuing anyway..."
+}
+
+# Try adb root with timeout
+echo "[android_world] Running adb root..."
+timeout 10 adb root || {
+    echo "[android_world] WARNING: adb root failed or timed out, continuing..."
+}
+
+# Wait briefly for device to reconnect after adb root
+sleep 5
+
+# Disable animations (optional but recommended for consistent testing)
+adb shell "settings put global window_animation_scale 0.0" 2>/dev/null || true
+adb shell "settings put global transition_animation_scale 0.0" 2>/dev/null || true
+adb shell "settings put global animator_duration_scale 0.0" 2>/dev/null || true
+
+# Hidden API policy
+adb shell "settings put global hidden_api_policy_pre_p_apps 1;settings put global hidden_api_policy_p_apps 1;settings put global hidden_api_policy 1" 2>/dev/null || true
+
+# --- Start the Server ---
+echo "[android_world] Starting Python server..."
+exec python3 -m server.android_server
