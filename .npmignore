@@ -1,0 +1,32 @@
+# Development
+src/
+test/
+.github/
+.vscode/
+.husky/
+.changeset/
+
+# Build artifacts
+node_modules/
+*.tsbuildinfo
+coverage/
+tmp/
+cache/
+
+# Heavy Assets (Not needed in SDK, downloaded via Docker)
+android_world/
+docker/
+.docker/
+
+# Configs
+tsconfig.json
+vitest.config.ts
+.eslintrc.js
+.prettierrc
+.gitignore
+.npmignore
+
+# Documentation
+benchmark.log
+import.log
+setup.log

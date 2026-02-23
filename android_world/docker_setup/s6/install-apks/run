@@ -63,6 +63,14 @@ echo "[install-apks] Device is online"
 # Wait a bit more for system to stabilize
 sleep 5
 
+# FAST PATH: Check if required package is already installed (Warm Boot / Snapshot)
+if [ "$REQUIRE_WOOTZAPP" -eq 1 ] && adb shell "pm list packages $REQUIRED_PACKAGE" 2>/dev/null | grep -q "$REQUIRED_PACKAGE"; then
+    echo "[install-apks] Required package $REQUIRED_PACKAGE is already installed (Warm Boot)."
+    echo "[install-apks] Skipping APK installation to save time."
+    touch "$MARKER_FILE"
+    exec sleep infinity
+fi
+
 # Check if APK directory exists and has APKs
 if [ ! -d "$APK_DIR" ]; then
     if [ "$REQUIRE_WOOTZAPP" -eq 1 ]; then

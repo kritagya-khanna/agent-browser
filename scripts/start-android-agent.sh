@@ -6,17 +6,18 @@ mkdir -p $AGENT_BROWSER_SOCKET_DIR
 
 echo "[Agent] Starting Agent Browser Service"
 
-# Resolve IP of android-service to avoid Chrome Host header security block
-echo "[Agent] Resolving android-service IP..."
+# Resolve IP of android-service via Docker's built-in DNS
+echo "[Agent] Resolving android-service IP via DNS..."
 ANDROID_IP=""
 until [ -n "$ANDROID_IP" ]; do
-  ANDROID_IP=$(getent hosts android-service | awk '{ print $1 }' | head -n 1)
+  ANDROID_IP=$(node -e 'require("dns").lookup("android-service", (err, addr) => { if(!err) console.log(addr) })' 2>/dev/null)
+  
   if [ -z "$ANDROID_IP" ]; then
-    echo "[Agent] Waiting for DNS resolution..."
+    echo "[Agent] Waiting for Docker DNS resolution of 'android-service'..."
     sleep 2
   fi
 done
-echo "[Agent] Android IP: $ANDROID_IP"
+echo "[Agent] Resolved Android IP: $ANDROID_IP"
 
 # Wait for CDP Bridge (Port 9224)
 echo "[Agent] Waiting for Android CDP at http://$ANDROID_IP:9224..."
@@ -26,24 +27,10 @@ until curl -s http://$ANDROID_IP:9224/json/version > /dev/null; do
 done
 echo "[Agent] CDP Bridge is ready!"
 
-# Start Daemon
-echo "[Agent] Starting Daemon..."
+# Start Daemon (Direct TCP Mode)
+echo "[Agent] Starting Daemon on port 3000..."
 export AGENT_BROWSER_CDP_URL=http://$ANDROID_IP:9224
-node dist/daemon.js &
-DAEMON_PID=$!
+export AGENT_BROWSER_TCP_PORT=3000
 
-# Start Socat Bridge for CLI
-SOCKET_FILE="$AGENT_BROWSER_SOCKET_DIR/default.sock"
-TCP_PORT=3000
-
-echo "[Agent] Waiting for socket..."
-while [ ! -S "$SOCKET_FILE" ]; do
-  if ! kill -0 $DAEMON_PID 2>/dev/null; then
-    echo "[Agent] Daemon crashed!"
-    exit 1
-  fi
-  sleep 0.5
-done
-
-echo "[Agent] Ready on port $TCP_PORT"
-exec socat TCP-LISTEN:$TCP_PORT,bind=0.0.0.0,reuseaddr,fork UNIX-CONNECT:$SOCKET_FILE
+# Run daemon in foreground (it manages its own lifecycle)
+exec node dist/daemon.js

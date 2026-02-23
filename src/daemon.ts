@@ -372,7 +372,15 @@ export async function startDaemon(options?: {
   // Write PID file before listening
   fs.writeFileSync(pidFile, process.pid.toString());
 
-  if (isWindows) {
+  // Check for explicit TCP port override (e.g. for Docker)
+  const tcpPortEnv = process.env.AGENT_BROWSER_TCP_PORT;
+
+  if (tcpPortEnv) {
+    const port = parseInt(tcpPortEnv, 10);
+    server.listen(port, '0.0.0.0', () => {
+      console.log(`Daemon listening on TCP 0.0.0.0:${port}`);
+    });
+  } else if (isWindows) {
     // Windows: use TCP socket on localhost
     const port = getPortForSession(currentSession);
     const portFile = getPortFile();

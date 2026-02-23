@@ -1,109 +1,70 @@
 #!/usr/bin/env node
 
 /**
- * Cross-platform CLI wrapper for agent-browser
+ * WootzApp Agent Browser CLI
  * 
- * This wrapper enables npx support on Windows where shell scripts don't work.
- * For global installs, postinstall.js patches the shims to invoke the native
- * binary directly (zero overhead).
+ * Provides terminal-based control over the Android Agent environment.
+ * Usage:
+ *   agent-browser start      - Initialize environment (Warm/Cold boot)
+ *   agent-browser stop       - Stop environment
+ *   agent-browser reset      - Fast browser reset (15s)
+ *   agent-browser open <url> - Open a URL in the browser
  */
 
-import { spawn } from 'child_process';
-import { existsSync, accessSync, chmodSync, constants } from 'fs';
-import { dirname, join } from 'path';
-import { fileURLToPath } from 'url';
-import { platform, arch } from 'os';
+import { WootzAgent } from '../dist/index.js';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
+const args = process.argv.slice(2);
+// Find the first argument that doesn't start with '-' to be the command
+const command = args.find(arg => !arg.startsWith('-'));
 
-// Map Node.js platform/arch to binary naming convention
-function getBinaryName() {
-  const os = platform();
-  const cpuArch = arch();
+if (!command || command === 'help') {
+  console.log(`
+WootzApp Agent Browser CLI
 
-  let osKey;
-  switch (os) {
-    case 'darwin':
-      osKey = 'darwin';
-      break;
-    case 'linux':
-      osKey = 'linux';
-      break;
-    case 'win32':
-      osKey = 'win32';
-      break;
-    default:
-      return null;
-  }
+Usage:
+  agent-browser start      Initialize and start the environment
+  agent-browser stop       Stop the environment
+  agent-browser reset      Fast reset the browser state
+  agent-browser <cmd>      Run an agent command (e.g. open https://google.com)
 
-  let archKey;
-  switch (cpuArch) {
-    case 'x64':
-    case 'x86_64':
-      archKey = 'x64';
-      break;
-    case 'arm64':
-    case 'aarch64':
-      archKey = 'arm64';
-      break;
-    default:
-      return null;
-  }
-
-  const ext = os === 'win32' ? '.exe' : '';
-  return `agent-browser-${osKey}-${archKey}${ext}`;
+Options:
+  --dist                   Use pre-built images from Docker Hub (default)
+  --local                  Build images locally from source
+`);
+  process.exit(0);
 }
 
-function main() {
-  const binaryName = getBinaryName();
+// Check for mode flags
+const isLocal = args.includes('--local');
+// Filter out the --local/--dist flags before passing to command if necessary, 
+// but currently our command() method handles raw args.
+const filteredArgs = args.filter(arg => arg !== '--local' && arg !== '--dist');
 
-  if (!binaryName) {
-    console.error(`Error: Unsupported platform: ${platform()}-${arch()}`);
-    process.exit(1);
-  }
+const agent = new WootzAgent({ dist: !isLocal });
 
-  const binaryPath = join(__dirname, binaryName);
-
-  if (!existsSync(binaryPath)) {
-    console.error(`Error: No binary found for ${platform()}-${arch()}`);
-    console.error(`Expected: ${binaryPath}`);
-    console.error('');
-    console.error('Run "npm run build:native" to build for your platform,');
-    console.error('or reinstall the package to trigger the postinstall download.');
-    process.exit(1);
-  }
-
-  // Ensure binary is executable (fixes EACCES on macOS/Linux when postinstall didn't run,
-  // e.g., when using bun which blocks lifecycle scripts by default)
-  if (platform() !== 'win32') {
-    try {
-      accessSync(binaryPath, constants.X_OK);
-    } catch {
-      // Binary exists but isn't executable - fix it
-      try {
-        chmodSync(binaryPath, 0o755);
-      } catch (chmodErr) {
-        console.error(`Error: Cannot make binary executable: ${chmodErr.message}`);
-        console.error('Try running: chmod +x ' + binaryPath);
-        process.exit(1);
-      }
+async function main() {
+  try {
+    switch (command) {
+      case 'start':
+        await agent.start();
+        break;
+      case 'stop':
+        await agent.stop();
+        break;
+      case 'reset':
+        await agent.reset();
+        break;
+      default:
+        // Pass through arbitrary commands to the agent daemon
+        // e.g. "agent-browser open https://google.com"
+        const result = await agent.command(...filteredArgs);
+        console.log(result);
+        break;
     }
-  }
-
-  // Spawn the native binary with inherited stdio
-  const child = spawn(binaryPath, process.argv.slice(2), {
-    stdio: 'inherit',
-    windowsHide: false,
-  });
-
-  child.on('error', (err) => {
-    console.error(`Error executing binary: ${err.message}`);
+  } catch (error) {
+    console.error(`\n❌ Error: ${error.message}`);
     process.exit(1);
-  });
-
-  child.on('close', (code) => {
-    process.exit(code ?? 0);
-  });
+  }
 }
 
 main();
